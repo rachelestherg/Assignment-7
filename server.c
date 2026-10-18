@@ -18,10 +18,13 @@
 #define REQUEST_CREATE 1
 #define REQUEST_JOIN 2
 #define REQUEST_MOVE 3
+#define REQUEST_RESUME 4
 
 struct request {
     int type;
     int value;
+    int player;
+    int gameId;
 };
 
 struct client_slot {
@@ -36,9 +39,25 @@ static struct game games[MAX_GAMES];
 static struct client_slot clients[MAX_CLIENTS];
 static int next_game_id = 0;
 
+static int load_saved_games(void) {
+    int loaded = 0;
+    for (int i = 0; i < MAX_GAMES; ++i) {
+        char path[128];
+        snprintf(path, sizeof(path), "game_%d.save", i);
+        if (loadgame((struct gameDB*)&games[i], path) == 0) {
+            games[i].gameId = i;
+            loaded = 1;
+            if (next_game_id <= i) {
+                next_game_id = i + 1;
+            }
+        }
+    }
+    return loaded;
+}
+
 static void send_game_to_client(int sock_fd, const struct sockaddr_in* dest, socklen_t dest_len,
                                const struct game* game_state) {
-    sendto(sock_fd, game_state, sizeof(*game_state), 0,
+    ssize_t sent = sendto(sock_fd, game_state, sizeof(*game_state), 0,
            (struct sockaddr *)dest, dest_len);
 }
 
@@ -87,25 +106,6 @@ static void broadcast_game(int sock_fd, int gameId) {
     }
 }
 
-static int load_saved_games(void) {
-    int loaded = 0;
-    for (int i = 0; i < MAX_GAMES; ++i) {
-        char path[128];
-        snprintf(path, sizeof(path), "game_%d.save", i);
-
-        if (access(path, F_OK) == 0) {
-            if (loadgame((struct gameDB*)&games[i], path) == 0) {
-                games[i].gameId = i;
-                loaded = 1;
-                if (next_game_id <= i) {
-                    next_game_id = i + 1;
-                }
-            }
-        }
-    }
-    return loaded;
-}
-
 int main(int argc, char* argv[]) {
     int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_fd < 0) {
@@ -142,7 +142,7 @@ int main(int argc, char* argv[]) {
 
         if (received != sizeof(req)) {
             continue;
-        }
+        } 
 
         int client_idx = find_client_index(&client_addr, client_len);
         if (client_idx < 0) {
@@ -154,6 +154,9 @@ int main(int argc, char* argv[]) {
         }
 
         if (req.type == REQUEST_CREATE) {
+            if (next_game_id >= MAX_GAMES) {
+                continue;
+            }
             int gameId = next_game_id++;
             new_game(&games[gameId], gameId);
             clients[client_idx].gameId = gameId;
@@ -170,19 +173,43 @@ int main(int argc, char* argv[]) {
             }
         } else if (req.type == REQUEST_MOVE) {
             int gameId = clients[client_idx].gameId;
+            int player = clients[client_idx].player;
             int col = req.value;
+
+            if (gameId < 0 && req.gameId >= 0 && req.gameId < next_game_id &&
+                req.gameId < MAX_GAMES && (req.player == 0 || req.player == 1)) {
+                gameId = req.gameId;
+                player = req.player;
+                clients[client_idx].gameId = gameId;
+                clients[client_idx].player = player;
+            }
 
             if (gameId >= 0 && gameId < MAX_GAMES &&
                 gameId < next_game_id &&
                 games[gameId].winner == -1 &&
-                games[gameId].current_player == clients[client_idx].player &&
+                games[gameId].current_player == player &&
                 col >= 0 && col < BOARD_COLS) {
-                if (make_move(&games[gameId], clients[client_idx].player, col)) {
+                if (make_move(&games[gameId], player, col)) {
                     broadcast_game(sock_fd, gameId);
                     save_game_state(gameId);
                 }
             }
-        }
+        } else if (req.type == REQUEST_RESUME) {
+            int gameId = req.value;
+            int player = req.player;
+
+            if (req.gameId != gameId || req.player != games[gameId].current_player) {
+                continue;
+            }
+            
+            if (gameId >= 0 && gameId < next_game_id && gameId < MAX_GAMES &&
+                (player == 0 || player == 1) && games[gameId].gameId == gameId) {
+                client_idx = find_client_index(&client_addr, client_len);
+                clients[client_idx].gameId = gameId;
+                clients[client_idx].player = player;
+                send_game_to_client(sock_fd, &clients[client_idx].addr, clients[client_idx].addr_len, &games[gameId]);
+            }
+        } 
     }
 
     close(sock_fd);
